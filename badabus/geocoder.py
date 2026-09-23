@@ -27,7 +27,7 @@ BBOX = "-7.05,38.83,-6.88,38.93"
 CENTRO_LAT, CENTRO_LON = 38.879, -6.970
 # Cartociudad searches all of Spain if it is not told where.
 MUNICIPIO = "Badajoz"
-USER_AGENT = "badabus/1.0 (proyecto personal; github.com/javierBF97/badabus)"
+USER_AGENT = "badabus/1.0 (proyecto personal; github.com/javierborrallo/badabus)"
 FETCH_MAX_BYTES = 1_000_000
 LIMITE = 5
 

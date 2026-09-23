@@ -1,6 +1,6 @@
 # Badabus
 
-[![CI](https://github.com/javierBF97/badabus/actions/workflows/ci.yml/badge.svg)](https://github.com/javierBF97/badabus/actions/workflows/ci.yml)
+[![CI](https://github.com/javierborrallo/badabus/actions/workflows/ci.yml/badge.svg)](https://github.com/javierborrallo/badabus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 An exploratory, unofficial project built on the data of the Badajoz city bus service. A map of
