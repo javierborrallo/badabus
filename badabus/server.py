@@ -2,6 +2,8 @@ import datetime
 import functools
 import json
 import socket
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +22,10 @@ DATA_FILES = {"paradas.json", "lineas.json", "red.json", "shapes.json", "dias.js
 ENV_FILE = BASE_DIR / ".env"
 # The arrival queries go in parallel, but without overloading the service.
 CONSULTAS_A_LA_VEZ = 8
+# Cap on refinement passes fetching exact stops for finalist routes.
+MAX_PASADAS_EN_VIVO = 3
+# Live arrivals are reused for a few seconds so repeat queries do not hammer the API.
+CACHE_ESPERAS_SEG = 30
 WEB_FILES = {"index.html", "app.js", "styles.css"}
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -127,10 +133,10 @@ class Handler(BaseHTTPRequestHandler):
             print(f"  ! error planning {origen_ids}->{destino_ids}: {exc}")
             self.fail(502, "could not work out a route")
             return
-        # Best-effort enrichment: if the live data fails, the answer goes out
-        # anyway. Only the stops where some route has you board are queried. The
-        # candidates are many more, and each one costs a request to the service.
-        esperas = esperas_en_vivo({ruta[0]["subir"] for ruta in rutas if ruta})
+        # Query one furthest boarding stop per first-leg line, then refine finalists.
+        iniciales = paradas_representativas(rutas, red)
+        consultadas = set(iniciales)
+        esperas = esperas_en_vivo(iniciales)
         try:
             ahora = datetime.datetime.now()
             horarios = frecuencias.cargar()
@@ -142,15 +148,15 @@ class Handler(BaseHTTPRequestHandler):
                 reales=distancias_reales(red, paradas),
             )
             elegidas = puntuar(rutas, esperas=esperas)
-            # The transfer arrivals are queried in a second pass, and only at the
-            # stops of the routes that survived: a handful, against all the candidate
-            # ones. With them the transfer wait is known instead of estimated, so the
-            # routes are scored again.
-            en_transbordo = {
-                t["subir"] for r in elegidas for t in r["tramos"][1:]
-            } - set(esperas)
-            if en_transbordo:
-                esperas.update(esperas_en_vivo(en_transbordo))
+            # Refine finalists until all their boarding/transfer stops are queried.
+            for _ in range(MAX_PASADAS_EN_VIVO):
+                faltan = {
+                    t["subir"] for r in elegidas for t in r["tramos"]
+                } - consultadas
+                if not faltan:
+                    break
+                consultadas |= faltan
+                esperas.update(esperas_en_vivo(faltan))
                 elegidas = puntuar(rutas, esperas=esperas)
             rutas = elegidas
         except (
@@ -302,16 +308,57 @@ def vecinas_de_paradas(paradas: dict) -> dict:
     return _VECINAS
 
 
-def esperas_en_vivo(paradas: set) -> dict:
-    """Minutes to the next bus of each line, per stop.
+_CACHE_ESPERAS: dict[str, tuple[float, float, dict]] = {}
+_CACHE_LOCK = threading.Lock()
 
-    The queries are independent and they spend almost all their time waiting for the
-    service, so to send them together costs what the slowest one costs, not the sum. If
-    one fails, the rest come back: the live data refines the order, it is not needed to
-    answer.
+
+def limpiar_cache_esperas() -> None:
+    """Forgets cached stop arrivals (for tests)."""
+    with _CACHE_LOCK:
+        _CACHE_ESPERAS.clear()
+
+
+def paradas_representativas(rutas: list[list[dict]], red: dict) -> set[str]:
+    """Return the furthest boarding stop along each first-leg line in `rutas`."""
+    por_linea: dict[str, set[str]] = {}
+    for ruta in rutas:
+        if not ruta:
+            continue
+        por_linea.setdefault(ruta[0]["linea"], set()).add(ruta[0]["subir"])
+
+    elegidas: set[str] = set()
+    for linea, paradas_subida in por_linea.items():
+        seq = red.get(linea) or []
+        pos: dict[str, int] = {}
+        for i, parada in enumerate(seq):
+            pos.setdefault(parada, i)
+        elegidas.add(max(paradas_subida, key=lambda p: pos.get(p, -1)))
+    return elegidas
+
+
+def esperas_en_vivo(paradas: set) -> dict:
+    """Minutes to the next bus of each line, per stop, with a short TTL cache.
+
+    Cached values discount elapsed seconds so arrivals do not drift stale during
+    the TTL window. If one stop fails, the rest still come back.
     """
     if not paradas:
         return {}
+
+    ahora = time.monotonic()
+    salida: dict[str, dict] = {}
+    pedir: list[str] = []
+    with _CACHE_LOCK:
+        for p in paradas:
+            entrada = _CACHE_ESPERAS.get(p)
+            if entrada and ahora < entrada[1]:
+                transcurrido = (ahora - entrada[0]) / 60.0
+                salida[p] = {lin: max(0.0, esp - transcurrido) for lin, esp in entrada[2].items()}
+            else:
+                pedir.append(p)
+
+    if not pedir:
+        return salida
 
     def consultar(parada: str):
         try:
@@ -321,7 +368,15 @@ def esperas_en_vivo(paradas: set) -> dict:
             return parada, None
 
     with ThreadPoolExecutor(max_workers=CONSULTAS_A_LA_VEZ) as pool:
-        return {p: e for p, e in pool.map(consultar, paradas) if e is not None}
+        nuevas = {p: e for p, e in pool.map(consultar, pedir) if e is not None}
+
+    guardado = time.monotonic()
+    expira = guardado + CACHE_ESPERAS_SEG
+    with _CACHE_LOCK:
+        for p, e in nuevas.items():
+            _CACHE_ESPERAS[p] = (guardado, expira, e)
+            salida[p] = dict(e)
+    return salida
 
 
 def punto_de_extremo(params: dict, prefijo: str, paradas: dict) -> tuple | None:

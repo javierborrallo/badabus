@@ -16,6 +16,7 @@ service: the search box keeps its short delay and its cache.
 """
 
 import json
+import math
 import urllib.request
 from collections.abc import Callable
 from urllib.parse import urlencode
@@ -133,10 +134,15 @@ def _cartociudad_buscar(consulta: str, fetcher: Callable[..., bytes]) -> list[di
     salida = []
     for sitio in datos if isinstance(datos, list) else []:
         try:
+            lat = float(sitio["lat"])
+            lon = float(sitio["lng"])
+            # Cartociudad returns (0.0, 0.0) for street-level entries with no geometry.
+            if not (math.isfinite(lat) and math.isfinite(lon)) or (lat == 0.0 and lon == 0.0):
+                continue
             salida.append({
                 "nombre": _nombre_cartociudad(sitio),
-                "lat": float(sitio["lat"]),
-                "lon": float(sitio["lng"]),
+                "lat": lat,
+                "lon": lon,
             })
         except (KeyError, TypeError, ValueError):
             continue

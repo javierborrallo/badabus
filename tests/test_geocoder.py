@@ -81,6 +81,15 @@ class TestBuscar(unittest.TestCase):
                         [])
         self.assertEqual(geocoder.buscar("algo", fetcher=fake), [])
 
+    def test_cartociudad_ignora_coordenadas_cero(self):
+        # Cartociudad returns lat=0.0, lng=0.0 for street entries with no point geometry.
+        sin_geom = [{"address": "RONDA PILAR", "muni": "Badajoz",
+                     "lat": 0.0, "lng": 0.0, "type": "callejero"}, *CARTO_PORTAL]
+        fake = responde(PHOTON_VACIO, sin_geom)
+        salida = geocoder.buscar("Ronda del Pilar", fetcher=fake)
+        self.assertEqual(len(salida), 1)
+        self.assertEqual(salida[0]["lat"], 38.8777)
+
     def test_sin_numero_el_nombre_es_solo_la_calle(self):
         fake = responde({"features": [{
             "geometry": {"coordinates": [-6.98, 38.87]},

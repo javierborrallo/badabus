@@ -551,6 +551,61 @@ class TestPuntuar(unittest.TestCase):
         self.assertEqual(len(salida), 1)
         self.assertEqual(salida[0]["tramos"][0]["subir"], "3")
 
+    def test_mismo_bus_prefiere_la_parada_mas_cercana(self):
+        # Boarding stop 1 (near) and stop 3 (farther along the line) catch the exact
+        # same bus and arrive at the exact same minute: covers the tie-break by walking
+        # without inflating the shown total.
+        red = {"A": ["1", "3", "2"]}
+        paradas = {"1": (38.880, -6.970), "3": (38.880, -6.967), "2": (38.880, -6.960)}
+        rutas = [
+            [{"linea": "A", "subir": "3", "bajar": "2"}],
+            [{"linea": "A", "subir": "1", "bajar": "2"}],
+        ]
+        salida = ranking.puntuar(
+            rutas, red, paradas, {"1": {"A": 12.0}},
+            andando_origen={"1": 0.05, "3": 0.30},
+        )
+        self.assertEqual(len(salida), 1)
+        self.assertEqual(salida[0]["tramos"][0]["subir"], "1")
+        r = salida[0]
+        self.assertLessEqual(
+            abs(r["total_min"] - (r["andando_min"] + r["espera_min"] + r["viaje_min"])), 1
+        )
+
+    def test_peso_andando_prefiere_menos_caminata_aunque_tarde_un_minuto_mas(self):
+        # Line A: ~1 min walk + 14 min wait + ~1 min ride = ~16 min clock.
+        # Line B: ~9 min walk + 5 min wait + ~1 min ride = ~15 min clock (1 min faster,
+        # but ~8 min more walking). PESO_ANDANDO ranks A ahead of B while keeping A's
+        # shown total un-inflated. Fails with PESO_ANDANDO = 1.0.
+        red = {"A": ["1", "2"], "B": ["3", "2"]}
+        paradas = {"1": (38.880, -6.970), "3": (38.880, -6.970), "2": (38.880, -6.966)}
+        rutas = [
+            [{"linea": "B", "subir": "3", "bajar": "2"}],
+            [{"linea": "A", "subir": "1", "bajar": "2"}],
+        ]
+        salida = ranking.puntuar(
+            rutas, red, paradas, {"1": {"A": 15.0}, "3": {"B": 14.0}},
+            andando_origen={"1": 0.06, "3": 0.52},
+        )
+        self.assertEqual(salida[0]["tramos"][0]["linea"], "A")
+        self.assertGreater(salida[0]["total_min"], salida[1]["total_min"] if len(salida) > 1 else 0)
+
+    def test_peso_andando_conserva_un_ahorro_real_de_tiempo(self):
+        # Line A: ~1 min walk + 20 min wait = ~22 min clock.
+        # Line B: ~7 min walk + 9 min wait = ~17 min clock (5 min faster for 6 min more
+        # walking: 5 > 6 * 0.3, so B must still win).
+        red = {"A": ["1", "2"], "B": ["3", "2"]}
+        paradas = {"1": (38.880, -6.970), "3": (38.880, -6.970), "2": (38.880, -6.966)}
+        rutas = [
+            [{"linea": "A", "subir": "1", "bajar": "2"}],
+            [{"linea": "B", "subir": "3", "bajar": "2"}],
+        ]
+        salida = ranking.puntuar(
+            rutas, red, paradas, {"1": {"A": 21.0}, "3": {"B": 16.0}},
+            andando_origen={"1": 0.06, "3": 0.40},
+        )
+        self.assertEqual(salida[0]["tramos"][0]["linea"], "B")
+
     def test_agrupa_las_lineas_que_hacen_el_mismo_tramo(self):
         # A and C run from 1 to 2 alike: it is one trip with two buses that serve it.
         rutas = [

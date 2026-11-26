@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import math
 import tempfile
 import threading
 import unittest
@@ -34,6 +35,7 @@ class TestServer(unittest.TestCase):
         self._orig_direccion = server.geocoder.direccion
         server.geocoder.buscar = lambda *a, **kw: []
         server.geocoder.direccion = lambda *a, **kw: ""
+        server.limpiar_cache_esperas()
         self.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -48,6 +50,7 @@ class TestServer(unittest.TestCase):
         bus_data_api.fetch_json = self._orig_fetch_json
         server.DATA_DIR = self._orig_data_dir
         server.WEB_DIR = self._orig_web_dir
+        server.limpiar_cache_esperas()
         self._tmp.cleanup()
 
     def get(self, path):
@@ -543,6 +546,114 @@ class TestServer(unittest.TestCase):
         status, body = self.get("/data/dias.json")
         self.assertEqual(status, 200)
         self.assertIn("LV", json.loads(body))
+
+    def test_paradas_representativas_elige_la_mas_avanzada_de_cada_linea(self):
+        red = {
+            "A": ["10", "11", "12", "13", "14"],
+            "B": ["20", "14", "21"],
+        }
+        rutas = [
+            [],
+            [{"linea": "A", "subir": "11", "bajar": "14"}],
+            [{"linea": "A", "subir": "14", "bajar": "14"}],
+            [{"linea": "B", "subir": "20", "bajar": "21"}],
+            [{"linea": "B", "subir": "14", "bajar": "21"}],
+            [{"linea": "X", "subir": "99", "bajar": "100"}],
+        ]
+        # A picks 14 (pos 4 > pos 1); B also picks 14 (deduplicated); missing X keeps 99;
+        # empty routes are ignored.
+        self.assertEqual(server.paradas_representativas(rutas, red), {"14", "99"})
+
+    def test_plan_refina_nueva_finalista_en_bucle_de_segunda_pasada(self):
+        # Line A has two candidate boarding stops (1 and 2); furthest is 2.
+        # Pass 1 queries stop 2 (bus A in 12 min), finalist is stop 1 (closer to origin),
+        # so Pass 2 must query stop 1 directly and use its own observed wait (4 min).
+        red = {"A": ["1", "2", "3"]}
+        dias = {"LV": ["A"]}
+        paradas = {"1": (38.880, -6.970), "2": (38.880, -6.968), "3": (38.880, -6.960)}
+        pedidas = []
+
+        def fake(action, **kw):
+            pedidas.append(kw["parada"])
+            if kw["parada"] == "2":
+                return [{"linea": "LÍNEA A", "distancia": "2000m", "tiempo": "12 Minutos."}]
+            if kw["parada"] == "1":
+                return [{"linea": "LÍNEA A", "distancia": "800m", "tiempo": "4 Minutos."}]
+            return []
+
+        orig = (server.planner.cargar_datos, server.dia.tipo_dia_actual,
+                bus_data_api.fetch_json, server.ranking.cargar_paradas)
+        server.planner.cargar_datos = lambda *a, **kw: (red, dias)
+        server.dia.tipo_dia_actual = lambda *a, **kw: ("LV", "Horario L - V")
+        server.ranking.cargar_paradas = lambda *a, **kw: paradas
+        bus_data_api.fetch_json = fake
+        try:
+            status, body = self.get("/api/plan?origen=1&destino=3")
+        finally:
+            (server.planner.cargar_datos, server.dia.tipo_dia_actual,
+             bus_data_api.fetch_json, server.ranking.cargar_paradas) = orig
+        self.assertEqual(status, 200)
+        self.assertIn("1", pedidas)
+        rutas = json.loads(body)["rutas"]
+        self.assertEqual(rutas[0]["tramos"][0]["subir"], "1")
+        self.assertEqual(rutas[0]["espera_min"], 4)
+
+    def test_esperas_en_vivo_cachea_y_descuenta_tiempo_transcurrido(self):
+        server.limpiar_cache_esperas()
+        llamadas = []
+        ahora = [1000.0]
+
+        def fake(action, **kw):
+            llamadas.append(kw["parada"])
+            return [
+                {"linea": "LÍNEA 5", "distancia": "500m", "tiempo": "3 Minutos."},
+                {"linea": "LÍNEA 2", "distancia": "100m", "tiempo": "Próximo."},
+                {"linea": "LÍNEA 9", "distancia": None, "tiempo": "Sin datos"},
+            ]
+
+        orig_fetch = bus_data_api.fetch_json
+        orig_mono = server.time.monotonic
+        bus_data_api.fetch_json = fake
+        server.time.monotonic = lambda: ahora[0]
+        try:
+            primera = server.esperas_en_vivo({"201"})
+            ahora[0] += 24.0  # 0.4 min elapsed, still within 30s TTL
+            segunda = server.esperas_en_vivo({"201"})
+        finally:
+            bus_data_api.fetch_json = orig_fetch
+            server.time.monotonic = orig_mono
+            server.limpiar_cache_esperas()
+        self.assertEqual(primera["201"]["5"], 3.0)
+        self.assertAlmostEqual(segunda["201"]["5"], 2.6, places=6)
+        self.assertEqual(segunda["201"]["2"], 0.0)
+        self.assertEqual(segunda["201"]["9"], math.inf)
+        self.assertEqual(llamadas, ["201"])
+
+    def test_plan_no_reintenta_parada_fallida_en_segunda_pasada(self):
+        red = {"A": ["1", "2"], "B": ["2", "3"]}
+        dias = {"LV": ["A", "B"]}
+        paradas = {"1": (38.880, -6.970), "2": (38.880, -6.966), "3": (38.880, -6.960)}
+        pedidas = []
+
+        def fake(action, **kw):
+            pedidas.append(kw["parada"])
+            if kw["parada"] == "2":
+                raise OSError("parada 2 caida")
+            return [{"linea": "LÍNEA A", "distancia": "500m", "tiempo": "3 Minutos."}]
+
+        orig = (server.planner.cargar_datos, server.dia.tipo_dia_actual,
+                bus_data_api.fetch_json, server.ranking.cargar_paradas)
+        server.planner.cargar_datos = lambda *a, **kw: (red, dias)
+        server.dia.tipo_dia_actual = lambda *a, **kw: ("LV", "Horario L - V")
+        server.ranking.cargar_paradas = lambda *a, **kw: paradas
+        bus_data_api.fetch_json = fake
+        try:
+            status, _ = self.get("/api/plan?origen=1&destino=3")
+        finally:
+            (server.planner.cargar_datos, server.dia.tipo_dia_actual,
+             bus_data_api.fetch_json, server.ranking.cargar_paradas) = orig
+        self.assertEqual(status, 200)
+        self.assertEqual(pedidas.count("2"), 1)
 
 
 if __name__ == "__main__":

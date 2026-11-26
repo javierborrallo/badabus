@@ -15,6 +15,7 @@ LIMITE_RUTAS = 4               # most alternatives returned
 
 VELOCIDAD_ANDANDO_KMH = 4.5    # a normal pace
 FACTOR_CALLEJEO = 1.3          # on foot you do not go straight either
+PESO_ANDANDO = 1.3             # walking weight in `comparable` (shown total stays un-weighted)
 RADIO_PARADAS_KM = 1.0         # sanity limit when looking for nearby stops
 RADIO_TRANSBORDO_KM = 0.3      # how far you walk between stops to transfer
 MARGEN_LLEGADA_MIN = 2         # margin to call a bus caught (walking is an estimate)
@@ -241,11 +242,10 @@ class Puntuada(NamedTuple):
     so ("from X min"): the application does not assert what it does not know.
 
     `comparable` decides the order, which route dominates which, and what is dropped for
-    being much worse. A floor is wrong there. To count zero for an unknown wait makes
-    the least known route win every time, because zero is the best possible number. A
-    route with "up to 20 min of wait" can erase from the screen another route whose 15
-    minutes are certain. The estimate follows the rule that transfers already use: half the frequency
-    where it is published, and a fixed figure where it is not.
+    being much worse. A floor is wrong there: counting zero for an unknown wait makes
+    the least known route win every time, so unknown waits use half the frequency where
+    published and a fixed figure otherwise. Walking is also weighted by `PESO_ANDANDO`
+    so catching the same bus at a farther stop never ties or beats the nearer one.
     """
 
     total: float
@@ -267,13 +267,13 @@ def _espera_estimada(espera: float | None, tope: float | None) -> float:
 
 
 def _orden(p: Puntuada) -> tuple:
-    """By estimated time, and with fewer legs when the time is equal.
+    """By generalized cost, then fewer legs, then less walking.
 
     The tie-break is not cosmetic. Without it, "take a line and then another bus" can
     slip ahead of that same line on its own, and the rule that drops detours never sees
     it.
     """
-    return (p.comparable, len(p.ruta))
+    return (p.comparable, len(p.ruta), p.andando)
 
 
 def _circula(p: Puntuada) -> bool:
@@ -320,17 +320,12 @@ def _fusionar_por_paradas(puntuadas: list) -> list:
 
 
 def _sin_dominadas(puntuadas: list) -> list:
-    """Removes the routes that another route equals or beats on everything that matters.
+    """Removes routes equalled or beaten on generalized cost, walking and transfers.
 
-    If another route arrives no later, makes you walk no further and has no more
-    transfers, this one is not an alternative: it suits nobody. The rule needs no view on what a minute walking
-    is worth against a minute waiting, which would be a matter of opinion. It is enough
-    that another route wins on all three.
-
-    The comparison uses `comparable`, not what the user sees. And a route whose wait is
-    unknown **cannot discard one whose wait is known**, however good its estimate looks:
-    that would erase a certainty on the strength of an assumption. It can sort ahead,
-    which is what the expected value says, but the other one is still offered.
+    The comparison uses `comparable` (which weights walking by `PESO_ANDANDO`), not the
+    clock total shown to the user. A route whose wait is unknown **cannot discard one
+    whose wait is known**, however good its estimate looks: it can sort ahead, but the
+    known one stays offered.
     """
     aceptadas: list[Puntuada] = []
     for p in puntuadas:
@@ -528,7 +523,7 @@ def puntuar(
     ahora_min: int | None = None,
     reales: dict | None = None,
 ) -> list[dict]:
-    """Orders the routes by estimated total time and filters out the much worse ones.
+    """Orders routes by generalized cost (`comparable`) and drops much worse ones.
 
     The total is walk + wait + ride, with the transfer waits inside. `esperas` is keyed
     ({stop_id: {line: minutes}}), because each candidate origin has its own.
@@ -593,10 +588,11 @@ def puntuar(
             ruta, red, paradas, esperas, horarios or {}, tipo_dia, ahora_min,
             hasta_la_parada + (espera or 0), reales,
         )
-        # Two totals on purpose: the floor that is shown and the estimate that
-        # decides. See `Puntuada`.
+        # Shown clock floor vs. generalized cost (`comparable`); see `Puntuada`.
         total = viaje + andando + (espera or 0) + transbordo
-        comparable = viaje + andando + _espera_estimada(espera, tope) + transbordo
+        comparable = (
+            viaje + andando * PESO_ANDANDO + _espera_estimada(espera, tope) + transbordo
+        )
         puntuadas.append(Puntuada(
             total, comparable, viaje, espera, tope, andando, transbordo, aviso, ruta))
 
