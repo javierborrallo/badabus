@@ -26,6 +26,10 @@ class TestServer(unittest.TestCase):
         )
         Path(self._tmp.name, "app.js").write_text("// app", encoding="utf-8")
         Path(self._tmp.name, "styles.css").write_text("/* css */", encoding="utf-8")
+        Path(self._tmp.name, "manifest.webmanifest").write_text('{"name":"badabus"}', encoding="utf-8")
+        Path(self._tmp.name, "sw.js").write_text("// sw", encoding="utf-8")
+        Path(self._tmp.name, "icon.svg").write_text("<svg></svg>", encoding="utf-8")
+        Path(self._tmp.name, "icon-192.png").write_bytes(b"\x89PNG\r\n\x1a\n")
         server.DATA_DIR = Path(self._tmp.name)
         server.WEB_DIR = Path(self._tmp.name)
         # Stubbed by default so that no test touches the network or the disk
@@ -104,6 +108,17 @@ class TestServer(unittest.TestCase):
     def test_serves_asset(self):
         status, _ = self.get("/app.js")
         self.assertEqual(status, 200)
+
+    def test_serves_pwa_assets_with_content_types(self):
+        casos = [
+            ("/manifest.webmanifest", "application/manifest+json"),
+            ("/sw.js", "text/javascript"),
+            ("/icon.svg", "image/svg+xml"),
+            ("/icon-192.png", "image/png"),
+        ]
+        for ruta, esperado in casos:
+            cabeceras = self.cabeceras(ruta)
+            self.assertIn(esperado, cabeceras["Content-Type"])
 
     def cabeceras(self, path):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as resp:
@@ -275,9 +290,11 @@ class TestServer(unittest.TestCase):
         server.planner.cargar_datos = lambda *a, **kw: (red, dias)
         server.dia.tipo_dia_actual = lambda *a, **kw: ("LV", "Horario L - V")
         server.ranking.cargar_paradas = lambda *a, **kw: paradas
-        bus_data_api.fetch_json = lambda action, **kw: [
-            {"linea": "LÍNEA A", "distancia": "1000m", "tiempo": "5 Minutos."}
-        ]
+        bus_data_api.fetch_json = lambda action, **kw: (
+            [{"linea": "LÍNEA A", "distancia": "1000m", "tiempo": "5 Minutos."}]
+            if kw.get("parada") == "1"
+            else []
+        )
         try:
             status, body = self.get("/api/plan?origen=1&destino=3")
         finally:
@@ -563,6 +580,16 @@ class TestServer(unittest.TestCase):
         # A picks 14 (pos 4 > pos 1); B also picks 14 (deduplicated); missing X keeps 99;
         # empty routes are ignored.
         self.assertEqual(server.paradas_representativas(rutas, red), {"14", "99"})
+        # With `limite`, lines reachable with a shorter walk from origin are prioritized.
+        andando = {"11": 0.6, "14": 0.8, "20": 0.1, "99": 0.4}
+        self.assertEqual(
+            server.paradas_representativas(rutas, red, andando_origen=andando, limite=1),
+            {"14"},
+        )
+        self.assertEqual(
+            server.paradas_representativas(rutas, red, andando_origen=andando, limite=2),
+            {"14", "99"},
+        )
 
     def test_plan_refina_nueva_finalista_en_bucle_de_segunda_pasada(self):
         # Line A has two candidate boarding stops (1 and 2); furthest is 2.
@@ -654,6 +681,64 @@ class TestServer(unittest.TestCase):
              bus_data_api.fetch_json, server.ranking.cargar_paradas) = orig
         self.assertEqual(status, 200)
         self.assertEqual(pedidas.count("2"), 1)
+
+    def test_plan_mismo_sitio_o_muy_cerca_no_propone_bus(self):
+        paradas = {"204": (38.8780, -6.9700), "1877": (38.8795, -6.9700)}
+        llamadas = []
+
+        def fake(action, **kw):
+            llamadas.append((action, kw))
+            return []
+
+        orig = (bus_data_api.fetch_json, server.ranking.cargar_paradas)
+        bus_data_api.fetch_json = fake
+        server.ranking.cargar_paradas = lambda *a, **kw: paradas
+        try:
+            s1, b1 = self.get("/api/plan?origen=1877&destino=1877")
+            s2, b2 = self.get("/api/plan?origen_lat=38.8796&origen_lon=-6.9701&destino=1877")
+        finally:
+            bus_data_api.fetch_json, server.ranking.cargar_paradas = orig
+        self.assertEqual(s1, 200)
+        self.assertEqual(s2, 200)
+        self.assertEqual(json.loads(b1)["rutas"], [])
+        self.assertEqual(json.loads(b1)["aviso"], "ya_estas_ahi")
+        self.assertEqual(json.loads(b2)["rutas"], [])
+        self.assertEqual(json.loads(b2)["aviso"], "ya_estas_ahi")
+        self.assertEqual(llamadas, [])
+
+    def test_tiempos_rellena_cache_compartida(self):
+        server.limpiar_cache_esperas()
+        llamadas = []
+
+        def fake(action, **kw):
+            llamadas.append(kw["parada"])
+            return [{"linea": "LÍNEA 3", "distancia": "300m", "tiempo": "5 Minutos."}]
+
+        orig_fetch = bus_data_api.fetch_json
+        bus_data_api.fetch_json = fake
+        try:
+            status, _ = self.get("/api/parada/201")
+            cacheadas = server.esperas_en_vivo({"201"})
+        finally:
+            bus_data_api.fetch_json = orig_fetch
+            server.limpiar_cache_esperas()
+        self.assertEqual(status, 200)
+        self.assertEqual(llamadas, ["201"])
+        self.assertAlmostEqual(cacheadas["201"]["3"], 5.0, delta=0.1)
+
+    def test_paradas_representativas_prefiere_no_ambigua(self):
+        red = {"M2": ["1844", "1858", "1786", "1787", "202", "220", "1786", "1787", "1788", "1844"]}
+        rutas = [
+            [{"linea": "M2", "subir": "1858", "bajar": "202"}],
+            [{"linea": "M2", "subir": "1786", "bajar": "202"}],
+        ]
+        self.assertEqual(server.paradas_representativas(rutas, red), {"1858"})
+        # Terminal 1844 closes the loop, so it is unambiguous and preferred over mid-route 1786.
+        con_cabecera = [
+            [{"linea": "M2", "subir": "1844", "bajar": "202"}],
+            [{"linea": "M2", "subir": "1786", "bajar": "202"}],
+        ]
+        self.assertEqual(server.paradas_representativas(con_cabecera, red), {"1844"})
 
 
 if __name__ == "__main__":

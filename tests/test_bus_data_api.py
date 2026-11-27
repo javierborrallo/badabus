@@ -129,5 +129,21 @@ class TestParseShape(unittest.TestCase):
         })
 
 
+class TestFetchRecorrido(unittest.TestCase):
+    def test_pide_el_fichero_de_la_linea(self):
+        pedidas = []
+
+        def fake(url, timeout=10):
+            pedidas.append(url)
+            return b'[{"stop_code":"1"}]'
+
+        self.assertEqual(api.fetch_recorrido("099_CA", fetcher=fake), [{"stop_code": "1"}])
+        self.assertEqual(pedidas, [f"{api.SHAPES_BASE}099_CA.json"])
+
+    def test_rechaza_lo_que_no_es_una_lista(self):
+        with self.assertRaises(ValueError):
+            api.fetch_recorrido("099_CA", fetcher=lambda url, timeout=10: b'{"a":1}')
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,14 @@ def fetch_shape(shape_id: str, fetcher: Callable[..., bytes] = fetch) -> list[di
     return data
 
 
+def fetch_recorrido(linea_id: str, fetcher: Callable[..., bytes] = fetch) -> list[dict]:
+    """Downloads the line plan, which keeps repeated stops, and returns the raw array."""
+    data = json.loads(fetcher(f"{SHAPES_BASE}{linea_id}.json"))
+    if not isinstance(data, list):
+        raise ValueError(f"{linea_id}.json: expected an array, not {type(data).__name__}")
+    return data
+
+
 def _correspondencias(linea_id: str, fetcher: Callable[..., bytes]) -> dict:
     """Raw response of the connections endpoint for one line."""
     query = urlencode({"action": "correspondencias", "linea": linea_id})
