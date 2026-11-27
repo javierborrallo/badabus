@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from badabus import planner
 
@@ -131,6 +132,62 @@ class TestTransbordoAndando(unittest.TestCase):
             {"linea": "A", "subir": "1", "bajar": "2"},
             {"linea": "D", "subir": "2", "bajar": "9"},
         ]])
+
+
+# Real M2 route: it starts and ends at 1844 and serves the 1786-1788 branch in both directions.
+M2 = [
+    "1844", "1846", "1854", "1855", "1856", "1857", "1858", "1786", "1787", "191", "246",
+    "240", "241", "160", "157", "201", "202", "207", "1867", "248", "236", "149", "153",
+    "261", "141", "218", "219", "220", "1786", "1787", "1788", "1845", "1844",
+]
+
+
+class TestTramoEnSecuencia(unittest.TestCase):
+    def test_ida_y_vuelta_en_ramal(self):
+        i, j = planner.tramo_en_secuencia(M2, "1786", "1845")
+        self.assertEqual((M2[i], M2[j], j - i), ("1786", "1845", 3))
+
+    def test_cabecera_en_los_dos_extremos(self):
+        self.assertEqual(planner.tramo_en_secuencia(M2, "202", "1844"), (16, len(M2) - 1))
+
+    def test_gana_el_par_mas_corto(self):
+        self.assertEqual(planner.tramo_en_secuencia(["a", "x", "a", "b"], "a", "b"), (2, 3))
+
+    def test_empate_gana_el_primero(self):
+        self.assertEqual(planner.tramo_en_secuencia(["a", "b", "a", "b"], "a", "b"), (0, 1))
+
+    def test_subir_igual_a_bajar(self):
+        self.assertIsNone(planner.tramo_en_secuencia(["a", "b", "a"], "a", "a"))
+
+    def test_parada_ausente_o_sin_sentido(self):
+        self.assertIsNone(planner.tramo_en_secuencia(["a", "b"], "a", "z"))
+        self.assertIsNone(planner.tramo_en_secuencia(["a", "b"], "z", "b"))
+        self.assertIsNone(planner.tramo_en_secuencia(["a", "b"], "b", "a"))
+
+
+class TestParadasRepetidas(unittest.TestCase):
+    def test_220_a_1787_en_m2_son_dos_paradas(self):
+        rutas = planner.planificar("220", "1787", {"M2": M2}, ["M2"])
+        self.assertEqual(rutas, [[{"linea": "M2", "subir": "220", "bajar": "1787"}]])
+        self.assertEqual(planner._paradas_tramo(rutas[0][0], {"M2": M2}), 2)
+
+    def test_el_coste_usa_el_tramo_mas_corto(self):
+        tramo = {"linea": "M2", "subir": "1786", "bajar": "1845"}
+        self.assertEqual(planner._paradas_tramo(tramo, {"M2": M2}), 3)
+
+    def test_no_sube_y_baja_en_la_misma_parada(self):
+        red = {"A": ["0", "8"], "L": ["1", "2", "1"]}
+        vecinas = {"8": [("1", 0.1)], "1": [("8", 0.1)]}
+        self.assertEqual(
+            planner.planificar_muchos(["0"], ["1"], red, ["A", "L"], vecinas=vecinas), []
+        )
+
+    def test_dos_pasadas_no_duplican_la_bajada(self):
+        # With two slots per stop, a duplicate from L pushes M out.
+        red = {"L": ["1", "2", "1", "3"], "M": ["1", "3"], "N": ["3", "4"]}
+        with mock.patch.object(planner, "CAMINOS_POR_PARADA", 2):
+            rutas = planner.planificar_muchos(["1"], ["4"], red, ["L", "M", "N"])
+        self.assertEqual(sorted(r[0]["linea"] for r in rutas), ["L", "M"])
 
 
 class TestCargarDatos(unittest.TestCase):

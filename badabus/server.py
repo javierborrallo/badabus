@@ -20,18 +20,35 @@ DATA_DIR = BASE_DIR / "data"
 WEB_DIR = BASE_DIR / "web"
 DATA_FILES = {"paradas.json", "lineas.json", "red.json", "shapes.json", "dias.json"}
 ENV_FILE = BASE_DIR / ".env"
-# The arrival queries go in parallel, but without overloading the service.
 CONSULTAS_A_LA_VEZ = 8
-# Cap on refinement passes fetching exact stops for finalist routes.
+# Per-request live stop query budgets for /api/plan (pass 1 and total).
+MAX_INICIALES_EN_VIVO = 6
+MAX_CONSULTAS_EN_VIVO = 8
 MAX_PASADAS_EN_VIVO = 3
-# Live arrivals are reused for a few seconds so repeat queries do not hammer the API.
 CACHE_ESPERAS_SEG = 30
-WEB_FILES = {"index.html", "app.js", "styles.css"}
+DISTANCIA_MISMO_SITIO_KM = 0.15
+WEB_FILES = {
+    "index.html",
+    "app.js",
+    "i18n.js",
+    "storage.js",
+    "mapa.js",
+    "vistas.js",
+    "styles.css",
+    "manifest.webmanifest",
+    "sw.js",
+    "icon.svg",
+    "icon-192.png",
+    "icon-512.png",
+}
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
 }
 
 
@@ -79,7 +96,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             data = api.fetch_json("tiempos", parada=stop_id)
-            body = json.dumps(api.parse_tiempos(data), ensure_ascii=False).encode("utf-8")
+            tiempos = api.parse_tiempos(data)
+            guardar_en_cache_esperas(stop_id, ranking.esperas_por_linea(tiempos))
+            body = json.dumps(tiempos, ensure_ascii=False).encode("utf-8")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             print(f"  ! error asking for the arrivals of {stop_id}: {exc}")
             self.fail(502, "could not reach the service")
@@ -100,14 +119,33 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(400, str(exc))
             return
         if not origen_ids or not destino_ids:
-            # With no coordinates loaded, the address is not far away: the data is
-            # missing. To say "out of the network" would blame the user for our fault.
             aviso = "fuera de la red" if paradas else "sin datos de paradas"
             body = json.dumps(
                 {"rutas": [], "aviso": aviso}, ensure_ascii=False
             )
             self.send_bytes(
                 200, body.encode("utf-8"), "application/json; charset=utf-8"
+            )
+            return
+        origen_id = (params.get("origen") or [""])[0]
+        destino_id = (params.get("destino") or [""])[0]
+        punto_o = punto_de_extremo(params, "origen", paradas)
+        punto_d = punto_de_extremo(params, "destino", paradas)
+        mismo_sitio = bool(origen_id and origen_id == destino_id)
+        if not mismo_sitio and punto_o and punto_d:
+            mismo_sitio = ranking.distancia_km(punto_o, punto_d) < DISTANCIA_MISMO_SITIO_KM
+        if mismo_sitio:
+            respuesta = {"rutas": [], "aviso": "ya_estas_ahi"}
+            if punto_o and punto_d:
+                km = ranking.distancia_km(punto_o, punto_d)
+                respuesta["a_pie"] = {
+                    "minutos": round(ranking.minutos_andando(km)),
+                    "metros": round(km * ranking.FACTOR_CALLEJEO * 1000),
+                }
+            self.send_bytes(
+                200,
+                json.dumps(respuesta, ensure_ascii=False).encode("utf-8"),
+                "application/json; charset=utf-8",
             )
             return
         try:
@@ -133,8 +171,10 @@ class Handler(BaseHTTPRequestHandler):
             print(f"  ! error planning {origen_ids}->{destino_ids}: {exc}")
             self.fail(502, "could not work out a route")
             return
-        # Query one furthest boarding stop per first-leg line, then refine finalists.
-        iniciales = paradas_representativas(rutas, red)
+        # Query one furthest boarding stop per closest first-leg line, then refine finalists.
+        iniciales = paradas_representativas(
+            rutas, red, andando_origen=andando_origen, limite=MAX_INICIALES_EN_VIVO
+        )
         consultadas = set(iniciales)
         esperas = esperas_en_vivo(iniciales)
         try:
@@ -155,8 +195,12 @@ class Handler(BaseHTTPRequestHandler):
                 } - consultadas
                 if not faltan:
                     break
-                consultadas |= faltan
-                esperas.update(esperas_en_vivo(faltan))
+                cupo = max(0, MAX_CONSULTAS_EN_VIVO - len(consultadas))
+                pedir = set(sorted(faltan)[:cupo]) if cupo < len(faltan) else faltan
+                if not pedir:
+                    break
+                consultadas |= pedir
+                esperas.update(esperas_en_vivo(pedir))
                 elegidas = puntuar(rutas, esperas=esperas)
             rutas = elegidas
         except (
@@ -318,7 +362,20 @@ def limpiar_cache_esperas() -> None:
         _CACHE_ESPERAS.clear()
 
 
-def paradas_representativas(rutas: list[list[dict]], red: dict) -> set[str]:
+def guardar_en_cache_esperas(parada: str, esperas_linea: dict) -> None:
+    """Stores parsed line waits for a stop in the shared TTL cache."""
+    guardado = time.monotonic()
+    expira = guardado + CACHE_ESPERAS_SEG
+    with _CACHE_LOCK:
+        _CACHE_ESPERAS[str(parada)] = (guardado, expira, dict(esperas_linea))
+
+
+def paradas_representativas(
+    rutas: list[list[dict]],
+    red: dict,
+    andando_origen: dict[str, float] | None = None,
+    limite: int | None = None,
+) -> set[str]:
     """Return the furthest boarding stop along each first-leg line in `rutas`."""
     por_linea: dict[str, set[str]] = {}
     for ruta in rutas:
@@ -326,13 +383,23 @@ def paradas_representativas(rutas: list[list[dict]], red: dict) -> set[str]:
             continue
         por_linea.setdefault(ruta[0]["linea"], set()).add(ruta[0]["subir"])
 
+    caminata = andando_origen or {}
+    lineas_ordenadas = sorted(
+        por_linea.items(),
+        key=lambda item: (min(caminata.get(p, 0.0) for p in item[1]), item[0]),
+    )
+
     elegidas: set[str] = set()
-    for linea, paradas_subida in por_linea.items():
+    for linea, paradas_subida in lineas_ordenadas:
+        if limite is not None and len(elegidas) >= limite:
+            break
         seq = red.get(linea) or []
+        ambiguas = ranking.paradas_ambiguas(seq)
         pos: dict[str, int] = {}
         for i, parada in enumerate(seq):
             pos.setdefault(parada, i)
-        elegidas.add(max(paradas_subida, key=lambda p: pos.get(p, -1)))
+        candidatas = [p for p in paradas_subida if p not in ambiguas] or paradas_subida
+        elegidas.add(max(candidatas, key=lambda p: pos.get(p, -1)))
     return elegidas
 
 
@@ -449,9 +516,28 @@ def ip_en_la_red() -> str:
         sock.close()
 
 
+def precargar_en_segundo_plano() -> None:
+    """Warm static stop/shape indexes and day type on startup."""
+    def tarea() -> None:
+        try:
+            paradas = ranking.cargar_paradas()
+            red, _ = planner.cargar_datos()
+            vecinas_de_paradas(paradas)
+            distancias_reales(red, paradas)
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            pass
+        try:
+            dia.tipo_dia_actual()
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
+            pass
+
+    threading.Thread(target=tarea, daemon=True).start()
+
+
 def main() -> None:
     host = leer_env(ENV_FILE).get("BADABUS_HOST", HOST_POR_DEFECTO)
     server = ThreadingHTTPServer((host, PORT), Handler)
+    precargar_en_segundo_plano()
     print(f"Serving on http://{host}:{PORT} (Ctrl+C to stop)")
     if host == "0.0.0.0":  # noqa: S104 — apertura deliberada, se pide en el .env
         ip = ip_en_la_red()

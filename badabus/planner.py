@@ -17,19 +17,38 @@ def cargar_datos(data_dir: Path = DATA_DIR) -> tuple[dict, dict]:
 
 
 def _indexar(red: dict, activas) -> tuple[dict, dict, dict]:
-    """Index of the active network: sequences, lines per stop and position in each line.
+    """Index of the active network: sequences, lines per stop and positions in each line.
 
-    `pos` holds the first occurrence of a stop in a line, which is what `list.index()`
-    looks up, so the list is not walked on every query.
+    `pos` holds every position of a stop in a line, so the list is not walked on every
+    query.
     """
     seq = {lin: red[lin] for lin in set(activas) if lin in red}
     por_parada: dict[str, set] = {}
-    pos: dict[tuple, int] = {}
+    pos: dict[tuple, list] = {}
     for lin, paradas in seq.items():
         for i, parada in enumerate(paradas):
             por_parada.setdefault(parada, set()).add(lin)
-            pos.setdefault((lin, parada), i)
-    return seq, por_parada, pos
+            pos.setdefault((lin, parada), []).append(i)
+    ordenadas = {parada: tuple(sorted(lins)) for parada, lins in por_parada.items()}
+    return seq, ordenadas, {clave: tuple(indices) for clave, indices in pos.items()}
+
+
+def tramo_en_secuencia(seq: list[str], subir: str, bajar: str) -> tuple[int, int] | None:
+    """Shortest forward leg from `subir` to `bajar` as (i, j), or None.
+
+    On a tie, the smallest `i` wins.
+    """
+    if subir == bajar:
+        return None
+    mejor = None
+    ultimo_subir = None
+    for j, parada in enumerate(seq):
+        if parada == subir:
+            ultimo_subir = j
+        elif parada == bajar and ultimo_subir is not None:
+            if mejor is None or j - ultimo_subir < mejor[1] - mejor[0]:
+                mejor = (ultimo_subir, j)
+    return mejor
 
 
 def _puntos_de_subida(parada: str, camino: tuple, vecinas: dict, pos: dict) -> list[str]:
@@ -50,7 +69,7 @@ def _puntos_de_subida(parada: str, camino: tuple, vecinas: dict, pos: dict) -> l
         return puntos
     linea = camino[-1]["linea"]
     for otra, _km in vecinas.get(parada, ()):
-        if pos.get((linea, otra)) is None:
+        if (linea, otra) not in pos:
             puntos.append(otra)
     return puntos
 
@@ -71,32 +90,44 @@ def planificar_muchos(
     hallado: dict[tuple, list] = {}
     etiquetas = {origen: [(origen, ())] for origen in origenes}
 
-    for _ronda in range(max_transbordos + 1):
+    for ronda in range(max_transbordos + 1):
+        ultima_ronda = ronda == max_transbordos
         siguiente: dict[str, list] = {}
         for parada, llegadas in etiquetas.items():
             for origen, camino in llegadas:
+                usadas = {t["linea"] for t in camino} if camino else ()
                 for punto in _puntos_de_subida(parada, camino, vecinas, pos):
-                    # Sorted: `por_parada` holds sets, and their order changes from
-                    # one run to the next. With the cap per stop, that order decides
-                    # which paths are kept, so the same query can give different
-                    # results.
-                    for lin in sorted(por_parada.get(punto, ())):
+                    for lin in por_parada.get(punto, ()):
                         # Nobody takes the same line twice in one trip.
-                        if any(t["linea"] == lin for t in camino):
+                        if lin in usadas:
                             continue
-                        i = pos.get((lin, punto))
-                        if i is None:
-                            continue
-                        for bajada in seq[lin][i + 1:]:
-                            # To come back to the starting point is not a trip (circular lines).
-                            if origen == bajada:
-                                continue
-                            ruta = (*camino, _tramo(lin, punto, bajada))
-                            if bajada in destinos:
-                                hallado.setdefault((origen, bajada), []).append(list(ruta))
-                            cola = siguiente.setdefault(bajada, [])
-                            if len(cola) < CAMINOS_POR_PARADA:
-                                cola.append((origen, ruta))
+                        # Alighting stops already emitted from this boarding stop on this line.
+                        vistas: set[str] = set()
+                        for i in pos.get((lin, punto), ()):
+                            for bajada in seq[lin][i + 1:]:
+                                # To come back to the starting point is not a trip (circular lines).
+                                if bajada in (origen, punto) or bajada in vistas:
+                                    continue
+                                vistas.add(bajada)
+                                es_destino = bajada in destinos
+                                if ultima_ronda:
+                                    if es_destino:
+                                        hallado.setdefault((origen, bajada), []).append(
+                                            [*camino, _tramo(lin, punto, bajada)]
+                                        )
+                                    continue
+                                cola = siguiente.get(bajada)
+                                cabe = cola is None or len(cola) < CAMINOS_POR_PARADA
+                                if not es_destino and not cabe:
+                                    continue
+                                ruta = (*camino, _tramo(lin, punto, bajada))
+                                if es_destino:
+                                    hallado.setdefault((origen, bajada), []).append(list(ruta))
+                                if cabe:
+                                    if cola is None:
+                                        siguiente[bajada] = [(origen, ruta)]
+                                    else:
+                                        cola.append((origen, ruta))
         etiquetas = siguiente
         if not etiquetas:
             break
@@ -123,9 +154,8 @@ def _tramo(linea: str, subir: str, bajar: str) -> dict:
 
 
 def _paradas_tramo(tramo: dict, seq: dict) -> int:
-    s = seq[tramo["linea"]]
-    i = s.index(tramo["subir"])
-    return 1 + s[i + 1:].index(tramo["bajar"])
+    i, j = tramo_en_secuencia(seq[tramo["linea"]], tramo["subir"], tramo["bajar"])
+    return j - i
 
 
 def _mejores(rutas: list, seq: dict, limite: int = 6) -> list:

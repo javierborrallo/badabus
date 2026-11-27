@@ -4,6 +4,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from badabus import bus_data_api as api
+from badabus.ranking import distancia_km
 
 
 def collect(fetcher: Callable[..., bytes] = api.fetch) -> tuple[list[dict], dict, dict, dict]:
@@ -29,6 +30,11 @@ def collect(fetcher: Callable[..., bytes] = api.fetch) -> tuple[list[dict], dict
         red[linea["lin"]] = [
             p["stop_code"] for p in sorted(validas, key=lambda p: int(p["secuencia"]))
         ]
+        try:
+            planos = api.fetch_recorrido(linea["id"], fetcher=fetcher)
+            red[linea["lin"]] = recorrido_con_repeticiones(red[linea["lin"]], planos)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"  ! no line plan for line {linea['lin']}: {exc}")
         for p in validas:
             stop = by_code.setdefault(p["stop_code"], {
                 "id": p["stop_code"],
@@ -46,6 +52,7 @@ def collect(fetcher: Callable[..., bytes] = api.fetch) -> tuple[list[dict], dict
         linea["lin"]: {"color": "#" + linea["color_fondo"], "nombre": linea["descripcion"]}
         for linea in lineas
     }
+    coords = {code: (stop["lat"], stop["lon"]) for code, stop in by_code.items()}
     shapes: dict[str, dict] = {}
     for linea in lineas:
         try:
@@ -54,7 +61,59 @@ def collect(fetcher: Callable[..., bytes] = api.fetch) -> tuple[list[dict], dict
         except (OSError, ValueError, KeyError, TypeError) as exc:
             print(f"  ! no shape for line {linea['lin']}: {exc}")
             continue
+        if linea["lin"] in red:
+            red[linea["lin"]] = cerrar_cabecera_retorno(
+                red[linea["lin"]], coords, shapes[linea["lin"]]
+            )
     return stops, meta, red, shapes
+
+
+def cerrar_cabecera_retorno(
+    seq: list[str],
+    coords: dict[str, tuple[float, float]],
+    shape_linea: dict,
+    umbral_km: float = 0.025,
+) -> list[str]:
+    """Appends `seq[0]` at the end when return shape direction '2' ends at the origin terminal."""
+    if len(seq) < 2 or seq[-1] == seq[0] or seq[0] not in coords:
+        return seq
+    vuelta = shape_linea.get("2") if isinstance(shape_linea, dict) else None
+    if not vuelta:
+        return seq
+    ultimo = vuelta[-1]
+    if not isinstance(ultimo, (list, tuple)) or len(ultimo) < 2:
+        return seq
+    try:
+        fin = (float(ultimo[0]), float(ultimo[1]))
+    except (TypeError, ValueError):
+        return seq
+    if distancia_km(fin, coords[seq[0]]) <= umbral_km:
+        return [*seq, seq[0]]
+    return seq
+
+
+def recorrido_con_repeticiones(orden_api: list[str], planos: list[dict]) -> list[str]:
+    """Route of a line with its repeated stops, from the line plan.
+
+    The result keeps the stops of `orden_api`, in the same order of first appearance.
+    If the line plan does not agree with that order, the result is `orden_api`.
+    """
+    conocidas = set(orden_api)
+    recorrido: list[str] = []
+    for fila in planos:
+        if not isinstance(fila, dict) or not fila.get("stop_code"):
+            continue
+        codigo = str(fila["stop_code"])
+        if codigo in conocidas and (not recorrido or recorrido[-1] != codigo):
+            recorrido.append(codigo)
+    # Put each missing stop after the first appearance of its predecessor.
+    for i, codigo in enumerate(orden_api):
+        if codigo not in recorrido:
+            recorrido.insert(recorrido.index(orden_api[i - 1]) + 1 if i else 0, codigo)
+    if list(dict.fromkeys(recorrido)) != orden_api:
+        print(f"  ! line plan does not match the API order, from stop {orden_api[:1]}: ignored")
+        return orden_api
+    return recorrido
 
 
 def recolectar_dias(fetcher: Callable[..., bytes] = api.fetch) -> dict[str, list[str]]:

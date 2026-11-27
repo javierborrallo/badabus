@@ -1,22 +1,26 @@
 import json
 import math
 import re
+from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 
 from badabus import frecuencias as frec
+from badabus.planner import tramo_en_secuencia
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
-VELOCIDAD_COMERCIAL_KMH = 20   # real commercial speed, measured from the arrivals
+VELOCIDAD_CRUCERO_KMH = 35     # cruising speed between stops
+TIEMPO_POR_PARADA_MIN = 0.7    # dwell and accel/decel minutes per stop
 FACTOR_SINUOSIDAD = 1.3        # the real course winds ~30% more than the line
-FACTOR_INFUMABLE = 1.5         # anything over 1.5x the best one is dropped
+FACTOR_DESCARTE = 1.5         # anything over 1.5x the best one is dropped
 LIMITE_RUTAS = 4               # most alternatives returned
 
-VELOCIDAD_ANDANDO_KMH = 4.5    # a normal pace
-FACTOR_CALLEJEO = 1.3          # on foot you do not go straight either
-PESO_ANDANDO = 1.3             # walking weight in `comparable` (shown total stays un-weighted)
-RADIO_PARADAS_KM = 1.0         # sanity limit when looking for nearby stops
+VELOCIDAD_ANDANDO_KMH = 4.5      # a normal pace
+FACTOR_CALLEJEO = 1.3            # on foot you do not go straight either
+PESO_ANDANDO = 1.3               # walking weight in `comparable` (shown total stays un-weighted)
+PENALIZACION_TRANSBORDO_MIN = 5  # transfer penalty in `comparable` (shown total stays untouched)
+RADIO_PARADAS_KM = 1.0           # sanity limit when looking for nearby stops
 RADIO_TRANSBORDO_KM = 0.3      # how far you walk between stops to transfer
 MARGEN_LLEGADA_MIN = 2         # margin to call a bus caught (walking is an estimate)
 ESPERA_TRANSBORDO_MIN = 5      # assumed at a transfer with no known frequency
@@ -63,82 +67,109 @@ def _puntos(sentido: list) -> list:
     return salida
 
 
+def _pasos_en_trazado(coord: tuple[float, float], pts: list, radio_km: float = 0.08) -> list[int]:
+    """Local nearest indices along `pts` within `radio_km`, falling back to global nearest."""
+    hits: list[int] = []
+    mejor: tuple[float, int] | None = None
+    for k, q in enumerate(pts):
+        d = distancia_km(coord, q)
+        if d < radio_km:
+            if mejor is None or d < mejor[0]:
+                mejor = (d, k)
+        elif mejor is not None:
+            hits.append(mejor[1])
+            mejor = None
+    if mejor is not None:
+        hits.append(mejor[1])
+    if not hits:
+        hits = [min(range(len(pts)), key=lambda i: distancia_km(coord, pts[i]))]
+    return hits
+
+
 def distancias_por_tramo(red: dict, paradas: dict, shapes: dict) -> dict:
-    """Road distance between consecutive stops: {(line, a, b): km}.
-
-    A straight line times a fixed factor is wrong in both directions. Measured over 491
-    legs, the real detour factor runs from 0.95 to 2.19, with a median of 1.10 against
-    the 1.30 that a single fixed factor gives every leg. Straight legs get too much
-    time. Winding legs get too little, and that is the direction that hurts, because it
-    makes you miss transfers.
-
-    The geometry is already downloaded, so the distance can be measured instead of
-    assumed. It is computed once: to scan the shapes on every query would be expensive.
-    """
+    """Road distance between consecutive stops: {(line, a, b): km}."""
     reales: dict[tuple, float] = {}
     for linea, seq in red.items():
         for sentido in (shapes.get(linea) or {}).values():
             pts = _puntos(sentido)
             if len(pts) < 2:
                 continue
-            # The shape point nearest to each stop, computed once per stop.
-            cerca = {}
-            for parada in set(seq):
-                if parada in paradas:
-                    cerca[parada] = min(
-                        range(len(pts)), key=lambda i: distancia_km(paradas[parada], pts[i])
-                    )
+            pasos = {p: _pasos_en_trazado(paradas[p], pts) for p in set(seq) if p in paradas}
+            acum = [0.0]
+            for k in range(len(pts) - 1):
+                acum.append(acum[-1] + distancia_km(pts[k], pts[k + 1]))
             for a, b in zip(seq, seq[1:], strict=False):
-                if a not in cerca or b not in cerca or cerca[b] <= cerca[a]:
+                if a not in pasos or b not in pasos:
                     continue
-                if (linea, a, b) in reales:
-                    continue
-                tramo = pts[cerca[a]:cerca[b] + 1]
-                km = sum(distancia_km(tramo[i], tramo[i + 1]) for i in range(len(tramo) - 1))
                 recta = distancia_km(paradas[a], paradas[b])
-                # A badly aligned shape can give nonsense, so impossible values are dropped.
-                if recta > 0 and recta <= km <= recta * 3:
-                    reales[(linea, a, b)] = km
+                if recta <= 0:
+                    continue
+                mejor_km: float | None = None
+                for ia in pasos[a]:
+                    for ib in pasos[b]:
+                        if ib <= ia:
+                            continue
+                        km = acum[ib] - acum[ia]
+                        if recta <= km <= recta * 3 and (mejor_km is None or km < mejor_km):
+                            mejor_km = km
+                if mejor_km is not None:
+                    prev = reales.get((linea, a, b))
+                    if prev is None or mejor_km < prev:
+                        reales[(linea, a, b)] = mejor_km
     return reales
+
+
+def _km_y_paradas_entre_indices(
+    linea: str, i: int, j: int, red: dict, paradas: dict, reales: dict
+) -> tuple[float, int]:
+    """Road distance and stop count of the line between positions `i` and `j`."""
+    entre = [s for s in red[linea][i:j + 1] if s in paradas]
+    if len(entre) < 2:
+        return 0.0, 0
+    km = 0.0
+    for a, b in zip(entre, entre[1:], strict=False):
+        medida = reales.get((linea, a, b))
+        km += medida if medida is not None else distancia_km(paradas[a], paradas[b]) * FACTOR_SINUOSIDAD
+    return km, len(entre) - 1
+
+
+def _minutos_entre_indices(
+    linea: str, i: int, j: int, red: dict, paradas: dict, reales: dict
+) -> float:
+    km, n_paradas = _km_y_paradas_entre_indices(linea, i, j, red, paradas, reales)
+    if n_paradas <= 0:
+        return 0.0
+    return km / VELOCIDAD_CRUCERO_KMH * 60 + n_paradas * TIEMPO_POR_PARADA_MIN
+
+
+def _km_tramo(
+    linea: str, subir: str, bajar: str, red: dict, paradas: dict, reales: dict
+) -> float:
+    indices = tramo_en_secuencia(red[linea], subir, bajar)
+    if indices is None:
+        raise ValueError(f"line {linea} does not go from {subir} to {bajar}")
+    km, _ = _km_y_paradas_entre_indices(linea, *indices, red, paradas, reales)
+    return km
+
+
+def _minutos_tramo(
+    linea: str, subir: str, bajar: str, red: dict, paradas: dict, reales: dict
+) -> float:
+    indices = tramo_en_secuencia(red[linea], subir, bajar)
+    if indices is None:
+        raise ValueError(f"line {linea} does not go from {subir} to {bajar}")
+    return _minutos_entre_indices(linea, *indices, red, paradas, reales)
 
 
 def minutos_viaje(
     ruta: list[dict], red: dict, paradas: dict, reales: dict | None = None
 ) -> float:
-    """Estimated ride time in minutes, at the mean commercial speed.
-
-    With `reales`, the road distance measured from the line shape is used. Without it,
-    the distance falls back to the straight line between stops times a fixed factor.
-    That is worse, but it does not need the downloaded geometry.
-
-    Stops without coordinates are ignored. The distance is summed between the stops
-    that remain, in order.
-
-    Note: the boarding stop resolves to its FIRST occurrence in the line sequence, and
-    the alighting stop to its first occurrence after that one.
-    This follows the same convention the planner uses to build legs. On out-and-back
-    lines, which repeat stops, a return leg can therefore be measured through more
-    intermediate stops than it should.
-    """
+    """Estimated ride time in minutes using cruising speed plus per-stop dwell time."""
     reales = reales or {}
-    km = 0.0
-    for tramo in ruta:
-        linea = tramo["linea"]
-        seq = red[linea]
-        i = seq.index(tramo["subir"])
-        j = i + 1 + seq[i + 1:].index(tramo["bajar"])
-        # Stops without coordinates are bridged: the distance is measured from the
-        # previous stop to the next one, which approximates better than dropping that
-        # part of the trip.
-        entre = [s for s in seq[i:j + 1] if s in paradas]
-        for a, b in zip(entre, entre[1:], strict=False):
-            medida = reales.get((linea, a, b))
-            if medida is not None:
-                km += medida
-            else:
-                # Without geometry for that leg, the corrected straight line is all there is.
-                km += distancia_km(paradas[a], paradas[b]) * FACTOR_SINUOSIDAD
-    return km / VELOCIDAD_COMERCIAL_KMH * 60
+    return sum(
+        _minutos_tramo(tramo["linea"], tramo["subir"], tramo["bajar"], red, paradas, reales)
+        for tramo in ruta
+    )
 
 
 def minutos_andando(km: float) -> float:
@@ -320,17 +351,15 @@ def _fusionar_por_paradas(puntuadas: list) -> list:
 
 
 def _sin_dominadas(puntuadas: list) -> list:
-    """Removes routes equalled or beaten on generalized cost, walking and transfers.
+    """Removes transfer routes equalled or beaten on generalized cost, walking and transfers.
 
-    The comparison uses `comparable` (which weights walking by `PESO_ANDANDO`), not the
-    clock total shown to the user. A route whose wait is unknown **cannot discard one
-    whose wait is known**, however good its estimate looks: it can sort ahead, but the
-    known one stays offered.
+    Direct routes are kept as-is and filtered later by `FACTOR_DESCARTE` and
+    `LIMITE_RUTAS`. Unknown waits never discard known ones.
     """
     aceptadas: list[Puntuada] = []
     for p in puntuadas:
         total, andando, saltos = p.comparable, p.andando, len(p.ruta)
-        if any(
+        if saltos > 1 and any(
             q.comparable <= total and q.andando <= andando and len(q.ruta) <= saltos
             and not (q.espera is None and p.espera is not None)
             for q in aceptadas
@@ -380,6 +409,7 @@ def _espera_en_transbordos(
     ruta: list, red: dict, paradas: dict, esperas: dict, horarios: dict,
     tipo_dia: str | None, ahora_min: int | None, desde_min: float,
     reales: dict | None = None,
+    viaje_tramo=None, pasadas_fn=None, intervalo_fn=None,
 ) -> float:
     """The wait at each transfer, read from live data instead of assumed.
 
@@ -395,18 +425,27 @@ def _espera_en_transbordos(
     total = 0.0
     reloj = desde_min          # minutes from now when the current leg starts
     for anterior, tramo in zip(ruta, ruta[1:], strict=False):
-        reloj += minutos_viaje([anterior], red, paradas, reales)
+        if viaje_tramo is not None:
+            reloj += viaje_tramo(anterior)
+        else:
+            reloj += minutos_viaje([anterior], red, paradas, reales)
         if anterior["bajar"] != tramo["subir"]:
             # The transfer is on foot: you must arrive before you can board.
             reloj += minutos_andando(km_entre_tramos([anterior, tramo], paradas))
         linea = tramo["linea"]
         intervalo = None
-        if horarios and tipo_dia and ahora_min is not None:
+        if intervalo_fn is not None:
+            intervalo = intervalo_fn(linea)
+        elif horarios and tipo_dia and ahora_min is not None:
             intervalo = frec.intervalo_min(horarios, linea, tipo_dia, ahora_min)
         # The same as at the start: it looks at when each bus calls at this stop, not
         # only the announced one, and takes the first one that can be reached in time.
-        pasos = pasadas_en_parada(
-            linea, tramo["subir"], esperas, red, paradas, reales, intervalo)
+        if pasadas_fn is not None:
+            pasos = pasadas_fn(linea, tramo["subir"], _indice_subida(tramo, red))
+        else:
+            pasos = pasadas_en_parada(
+                linea, tramo["subir"], esperas, red, paradas, reales, intervalo,
+                indice=_indice_subida(tramo, red))
         alcanzables = [t for t in pasos if t >= reloj + MARGEN_LLEGADA_MIN]
         if alcanzables:
             espera = min(alcanzables) - reloj
@@ -417,47 +456,51 @@ def _espera_en_transbordos(
     return total
 
 
+def _indice_subida(tramo: dict, red: dict) -> int | None:
+    """Position in the line sequence where the leg boards."""
+    indices = tramo_en_secuencia(red.get(tramo["linea"]) or [], tramo["subir"], tramo["bajar"])
+    return indices[0] if indices else None
+
+
+def paradas_ambiguas(seq: list[str]) -> set[str]:
+    """Stops served more than once before the loop-closing return terminal."""
+    sin_cierre = seq[:-1] if len(seq) >= 2 and seq[0] == seq[-1] else seq
+    return {p for p, n in Counter(sin_cierre).items() if n > 1}
+
+
 def pasadas_en_parada(
     linea: str, parada: str, esperas: dict, red: dict, paradas: dict,
     reales: dict | None = None, intervalo: float | None = None,
+    indice: int | None = None,
 ) -> list[float]:
-    """Minutes from now at which each bus of that line calls at that stop.
+    """Minutes from now at which each bus of that line calls at `parada`.
 
-    The service reports **one single arrival per line and stop**, but that bus runs the
-    whole line: if it calls at one stop in ten minutes, it reaches the next one in ten
-    plus the ride. So one observation at any stop is good for every other stop on its
-    line.
-
-    This is what shows that two different stops put you on **the same vehicle**. Compared
-    as separate waits, a far stop would appear to "wait less", and twice the walk would be
-    proposed to end up on the same bus and arrive at the same time.
-
-    Negative values are buses that have already gone past here. They are kept because
-    adding the frequency to them gives the following ones.
+    `indice` selects the pass when `parada` repeats mid-route; without it, an ambiguous
+    stop returns an empty list. Loop-closing terminals (`seq[0] == seq[-1]`) are
+    unambiguous at index 0. Observations at mid-route repeated stops are ignored.
     """
     seq = red.get(linea) or []
     if parada not in seq:
         return []
-    aqui = seq.index(parada)
+    ambiguas = paradas_ambiguas(seq)
+    if indice is None and parada in ambiguas:
+        return []
+    aqui = seq.index(parada) if indice is None else indice
+    reales = reales or {}
     vistas = []
     for otra, lineas in esperas.items():
         observada = lineas.get(linea)
-        if observada is None or observada == math.inf or otra not in seq:
+        if observada is None or observada == math.inf or otra not in seq or otra in ambiguas:
             continue
         alli = seq.index(otra)
         if alli == aqui:
             vistas.append(float(observada))
         elif alli < aqui:
-            # The bus comes from there, so it reaches here later.
-            vistas.append(observada + minutos_viaje(
-                [_tramo_simple(linea, otra, parada)], red, paradas, reales))
+            vistas.append(observada + _minutos_entre_indices(linea, alli, aqui, red, paradas, reales))
         else:
-            # It has already gone past here on its way there.
-            vistas.append(observada - minutos_viaje(
-                [_tramo_simple(linea, parada, otra)], red, paradas, reales))
+            vistas.append(observada - _minutos_entre_indices(linea, aqui, alli, red, paradas, reales))
     if not vistas:
         return []
-    # Each observation also gives the following buses, one frequency apart.
     salida = set()
     for t in vistas:
         salida.add(round(t, 2))
@@ -467,13 +510,10 @@ def pasadas_en_parada(
     return sorted(salida)
 
 
-def _tramo_simple(linea: str, subir: str, bajar: str) -> dict:
-    return {"linea": linea, "subir": subir, "bajar": bajar}
-
-
 def _resolver_espera(
     linea: str, pasadas: list, hasta_la_parada: float, camina: bool,
     horarios: dict, tipo_dia: str | None, ahora_min: int | None,
+    intervalo_fn=None, en_servicio_fn=None,
 ) -> tuple:
     """How long the wait for the bus is, and what can be asserted about it.
 
@@ -487,9 +527,18 @@ def _resolver_espera(
     """
     intervalo = None
     if horarios and tipo_dia and ahora_min is not None:
-        if frec.en_servicio(horarios, linea, tipo_dia, ahora_min) is False:
+        activo = (
+            en_servicio_fn(linea, ahora_min)
+            if en_servicio_fn is not None
+            else frec.en_servicio(horarios, linea, tipo_dia, ahora_min)
+        )
+        if activo is False:
             return None, None, "fuera_de_servicio"
-        intervalo = frec.intervalo_min(horarios, linea, tipo_dia, ahora_min)
+        intervalo = (
+            intervalo_fn(linea)
+            if intervalo_fn is not None
+            else frec.intervalo_min(horarios, linea, tipo_dia, ahora_min)
+        )
 
     if not pasadas:
         # Without live data the last bus is unknown, but the frequency bounds the
@@ -504,7 +553,13 @@ def _resolver_espera(
 
     primera = min(alcanzables)
     if ahora_min is not None and horarios:
-        if frec.en_servicio(horarios, linea, tipo_dia, int(ahora_min + primera)) is False:
+        minuto_subida = int(ahora_min + primera)
+        activo_subida = (
+            en_servicio_fn(linea, minuto_subida)
+            if en_servicio_fn is not None
+            else frec.en_servicio(horarios, linea, tipo_dia, minuto_subida)
+        )
+        if activo_subida is False:
             return None, None, "fuera_de_servicio"
     # If one goes past before you can be ready, that bus is missed, and it is worth saying so.
     perdido = any(0 <= t < listo for t in pasadas)
@@ -550,48 +605,80 @@ def puntuar(
             for ruta in rutas[:LIMITE_RUTAS]
         ]
 
-    # When each bus calls at each stop, computed once per line and stop, because it
-    # repeats across very many routes.
+    # Memoize per-call lookups repeated across thousands of candidate routes.
+    reales_map = reales or {}
+    horarios_map = horarios or {}
     memoria: dict[tuple, list] = {}
+    memo_km_tramo: dict[tuple, float] = {}
+    memo_intervalo: dict[str, float | None] = {}
+    memo_servicio: dict[tuple, bool | None] = {}
 
-    def pasadas(linea: str, parada: str) -> list:
-        clave = (linea, parada)
+    def intervalo_linea(linea: str) -> float | None:
+        if not (horarios_map and tipo_dia and ahora_min is not None):
+            return None
+        if linea not in memo_intervalo:
+            memo_intervalo[linea] = frec.intervalo_min(horarios_map, linea, tipo_dia, ahora_min)
+        return memo_intervalo[linea]
+
+    def servicio_linea(linea: str, minuto: int) -> bool | None:
+        if not (horarios_map and tipo_dia):
+            return None
+        clave = (linea, minuto)
+        if clave not in memo_servicio:
+            memo_servicio[clave] = frec.en_servicio(horarios_map, linea, tipo_dia, minuto)
+        return memo_servicio[clave]
+
+    def viaje_tramo(tramo: dict) -> float:
+        clave = (tramo["linea"], tramo["subir"], tramo["bajar"])
+        if clave not in memo_km_tramo:
+            memo_km_tramo[clave] = _minutos_tramo(
+                tramo["linea"], tramo["subir"], tramo["bajar"], red, paradas, reales_map
+            )
+        return memo_km_tramo[clave]
+
+    def pasadas(linea: str, parada: str, indice: int | None) -> list:
+        clave = (linea, parada, indice)
         if clave not in memoria:
-            intervalo = None
-            if horarios and tipo_dia and ahora_min is not None:
-                intervalo = frec.intervalo_min(horarios, linea, tipo_dia, ahora_min)
             memoria[clave] = pasadas_en_parada(
-                linea, parada, esperas, red, paradas, reales, intervalo)
+                linea, parada, esperas, red, paradas, reales_map, intervalo_linea(linea),
+                indice=indice,
+            )
         return memoria[clave]
 
     puntuadas = []
     for ruta in rutas:
         subir = ruta[0]["subir"]
         bajar = ruta[-1]["bajar"]
-        viaje = minutos_viaje(ruta, red, paradas, reales)
+        viaje = sum(viaje_tramo(t) for t in ruta)
         km = (andando_origen.get(subir, 0.0) + andando_destino.get(bajar, 0.0)
               + km_entre_tramos(ruta, paradas))
         andando = minutos_andando(km)
         hasta_la_parada = minutos_andando(andando_origen.get(subir, 0.0))
         espera, tope, aviso = _resolver_espera(
             ruta[0]["linea"],
-            pasadas(ruta[0]["linea"], subir),
+            pasadas(ruta[0]["linea"], subir, _indice_subida(ruta[0], red)),
             hasta_la_parada,
             subir in andando_origen,
-            horarios or {}, tipo_dia, ahora_min,
+            horarios_map, tipo_dia, ahora_min,
+            intervalo_fn=intervalo_linea, en_servicio_fn=servicio_linea,
         )
         # The transfer is reached after the walk TO THE FIRST STOP and the ride. The
         # walk at the destination happens after leaving the last bus, not before
         # boarding the second one. To count it here would advance the clock and pick
         # the wrong connecting bus.
         transbordo = _espera_en_transbordos(
-            ruta, red, paradas, esperas, horarios or {}, tipo_dia, ahora_min,
-            hasta_la_parada + (espera or 0), reales,
+            ruta, red, paradas, esperas, horarios_map, tipo_dia, ahora_min,
+            hasta_la_parada + (espera or 0), reales_map,
+            viaje_tramo=viaje_tramo, pasadas_fn=pasadas, intervalo_fn=intervalo_linea,
         )
         # Shown clock floor vs. generalized cost (`comparable`); see `Puntuada`.
         total = viaje + andando + (espera or 0) + transbordo
         comparable = (
-            viaje + andando * PESO_ANDANDO + _espera_estimada(espera, tope) + transbordo
+            viaje
+            + andando * PESO_ANDANDO
+            + _espera_estimada(espera, tope)
+            + transbordo
+            + PENALIZACION_TRANSBORDO_MIN * (len(ruta) - 1)
         )
         puntuadas.append(Puntuada(
             total, comparable, viaje, espera, tope, andando, transbordo, aviso, ruta))
@@ -613,7 +700,7 @@ def puntuar(
     # The much worse routes are dropped first, and only then the list is trimmed.
     # Otherwise a good route can fall outside the limit because of another one that
     # is dropped later.
-    aceptables = [p for p in puntuadas if p.comparable <= mejor * FACTOR_INFUMABLE]
+    aceptables = [p for p in puntuadas if p.comparable <= mejor * FACTOR_DESCARTE]
     return [
         {
             "tramos": p.ruta,

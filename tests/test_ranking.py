@@ -33,7 +33,10 @@ class TestMinutosViaje(unittest.TestCase):
             + ranking.distancia_km(self.PARADAS["2"], self.PARADAS["3"])
             + ranking.distancia_km(self.PARADAS["3"], self.PARADAS["4"])
         )
-        esperado = km * ranking.FACTOR_SINUOSIDAD / ranking.VELOCIDAD_COMERCIAL_KMH * 60
+        esperado = (
+            km * ranking.FACTOR_SINUOSIDAD / ranking.VELOCIDAD_CRUCERO_KMH * 60
+            + 3 * ranking.TIEMPO_POR_PARADA_MIN
+        )
         self.assertAlmostEqual(ranking.minutos_viaje(ruta, self.RED, self.PARADAS), esperado, places=6)
 
     def test_ignora_paradas_sin_coordenadas(self):
@@ -43,16 +46,14 @@ class TestMinutosViaje(unittest.TestCase):
             ranking.distancia_km(paradas["1"], paradas["3"])
             + ranking.distancia_km(paradas["3"], paradas["4"])
         )
-        esperado = km * ranking.FACTOR_SINUOSIDAD / ranking.VELOCIDAD_COMERCIAL_KMH * 60
+        esperado = (
+            km * ranking.FACTOR_SINUOSIDAD / ranking.VELOCIDAD_CRUCERO_KMH * 60
+            + 2 * ranking.TIEMPO_POR_PARADA_MIN
+        )
         self.assertAlmostEqual(ranking.minutos_viaje(ruta, self.RED, paradas), esperado, places=6)
 
     def test_paradas_repetidas_ida_y_vuelta(self):
-        # Regression: a line with repeated stops, outward and back.
-        # It fixes the known behaviour: indexes resolve to the FIRST
-        # occurrence, so a return leg is measured with more hops than it
-        # should be. This is consistent with how the planner builds its legs,
-        # but it is not what is ideally wanted in terms of measurement
-        # accuracy.
+        # Out-and-back line: the shortest leg from B to A is the last hop.
         red = {"L1": ["A", "B", "C", "D", "C", "B", "A"]}
         paradas = {
             "A": (38.880, -6.970),
@@ -60,18 +61,12 @@ class TestMinutosViaje(unittest.TestCase):
             "C": (38.880, -6.950),
             "D": (38.880, -6.940),
         }
-        # Return leg: from B, on the way back at index 5, to A at index 6.
-        # But seq.index("B") = 1, the first occurrence, so it is calculated
-        # from B(1) to A(6), through B->C->D->C->B->A, five hops.
         ruta = [{"linea": "L1", "subir": "B", "bajar": "A"}]
-        km = (
-            ranking.distancia_km(paradas["B"], paradas["C"])
-            + ranking.distancia_km(paradas["C"], paradas["D"])
-            + ranking.distancia_km(paradas["D"], paradas["C"])
-            + ranking.distancia_km(paradas["C"], paradas["B"])
-            + ranking.distancia_km(paradas["B"], paradas["A"])
+        km = ranking.distancia_km(paradas["B"], paradas["A"])
+        esperado = (
+            km * ranking.FACTOR_SINUOSIDAD / ranking.VELOCIDAD_CRUCERO_KMH * 60
+            + 1 * ranking.TIEMPO_POR_PARADA_MIN
         )
-        esperado = km * ranking.FACTOR_SINUOSIDAD / ranking.VELOCIDAD_COMERCIAL_KMH * 60
         self.assertAlmostEqual(ranking.minutos_viaje(ruta, red, paradas), esperado, places=6)
 
     def test_ruta_multi_tramo_suma_correctamente(self):
@@ -102,7 +97,10 @@ class TestMinutosViaje(unittest.TestCase):
             + ranking.distancia_km(paradas["4"], paradas["5"])
         )
         km_total = km1 + km2
-        esperado = km_total * ranking.FACTOR_SINUOSIDAD / ranking.VELOCIDAD_COMERCIAL_KMH * 60
+        esperado = (
+            km_total * ranking.FACTOR_SINUOSIDAD / ranking.VELOCIDAD_CRUCERO_KMH * 60
+            + 4 * ranking.TIEMPO_POR_PARADA_MIN
+        )
         self.assertAlmostEqual(ranking.minutos_viaje(ruta, red, paradas), esperado, places=6)
 
 
@@ -155,7 +153,7 @@ class TestPuntuar(unittest.TestCase):
         "6": (38.890, -6.968),
     }
 
-    def test_ordena_por_total_y_filtra_infumables(self):
+    def test_ordena_por_total_y_filtra_descartadas(self):
         rutas = [
             [{"linea": "B", "subir": "1", "bajar": "2"}],
             [{"linea": "A", "subir": "1", "bajar": "2"}],
@@ -615,6 +613,124 @@ class TestPuntuar(unittest.TestCase):
         salida = ranking.puntuar(rutas, self.RED, self.PARADAS, {})
         self.assertEqual(len(salida), 1)
         self.assertEqual(salida[0]["tramos"][0]["alternativas"], ["C"])
+
+
+class TestParadasRepetidasEnRanking(unittest.TestCase):
+    # "b" is served twice: index 1 and index 3.
+    RED = {"L": ["a", "b", "c", "b", "d"]}
+    PARADAS = {
+        "a": (38.880, -6.970),
+        "b": (38.880, -6.960),
+        "c": (38.880, -6.950),
+        "d": (38.880, -6.940),
+    }
+
+    def minutos(self, *ids):
+        km = sum(
+            ranking.distancia_km(self.PARADAS[a], self.PARADAS[b]) * ranking.FACTOR_SINUOSIDAD
+            for a, b in zip(ids, ids[1:], strict=False)
+        )
+        return (
+            km / ranking.VELOCIDAD_CRUCERO_KMH * 60
+            + (len(ids) - 1) * ranking.TIEMPO_POR_PARADA_MIN
+        )
+
+    def pasadas(self, parada, esperas, **kw):
+        return ranking.pasadas_en_parada("L", parada, esperas, self.RED, self.PARADAS, **kw)
+
+    def test_km_tramo_usa_el_tramo_corto_de_m2(self):
+        ramal = ["1786", "1787", "1788", "1845"]
+        seq = ["1844", "1786", "1787", "191", "220", *ramal, "1844"]
+        paradas = {p: (38.880, -6.970 + n / 1000) for n, p in enumerate(dict.fromkeys(seq))}
+        esperado = sum(
+            ranking.distancia_km(paradas[a], paradas[b]) * ranking.FACTOR_SINUOSIDAD
+            for a, b in zip(ramal, ramal[1:], strict=False)
+        )
+        km = ranking._km_tramo("L", "1786", "1845", {"L": seq}, paradas, {})
+        self.assertAlmostEqual(km, esperado, places=6)
+
+    def test_ignora_observaciones_en_paradas_repetidas(self):
+        self.assertEqual(self.pasadas("c", {"b": {"L": 5.0}}), [])
+
+    def test_propaga_hasta_la_pasada_indicada(self):
+        esperas = {"a": {"L": 2.0}}
+        self.assertEqual(
+            self.pasadas("b", esperas, indice=1), [round(2.0 + self.minutos("a", "b"), 2)]
+        )
+        self.assertEqual(
+            self.pasadas("b", esperas, indice=3),
+            [round(2.0 + self.minutos("a", "b", "c", "b"), 2)],
+        )
+
+    def test_resta_el_viaje_si_la_observacion_va_por_delante(self):
+        self.assertEqual(
+            self.pasadas("b", {"d": {"L": 20.0}}, indice=1),
+            [round(20.0 - self.minutos("b", "c", "b", "d"), 2)],
+        )
+
+    def test_parada_repetida_sin_indice_no_afirma_nada(self):
+        self.assertEqual(self.pasadas("b", {"a": {"L": 2.0}}), [])
+
+    def test_puntuar_usa_la_pasada_en_la_que_se_sube(self):
+        salida = ranking.puntuar(
+            [[{"linea": "L", "subir": "b", "bajar": "d"}]], self.RED, self.PARADAS,
+            {"a": {"L": 10.0}},
+        )
+        self.assertEqual(salida[0]["espera_min"], round(10.0 + self.minutos("a", "b", "c", "b")))
+
+    def test_el_transbordo_usa_la_pasada_en_la_que_se_sube(self):
+        red = {**self.RED, "A": ["x", "b"]}
+        paradas = {**self.PARADAS, "x": (38.880, -6.961)}
+        ruta = [{"linea": "A", "subir": "x", "bajar": "b"},
+                {"linea": "L", "subir": "b", "bajar": "d"}]
+        salida = ranking.puntuar([ruta], red, paradas, {"x": {"A": 0.0}, "a": {"L": 10.0}})
+        reloj = ranking.minutos_viaje([ruta[0]], red, paradas)
+        paso = round(10.0 + self.minutos("a", "b", "c", "b"), 2)
+        self.assertEqual(salida[0]["espera_transbordo_min"], round(paso - reloj))
+
+    def test_cabecera_de_retorno_no_es_ambigua(self):
+        red = {"L": ["a", "b", "c", "a"]}
+        self.assertEqual(ranking.paradas_ambiguas(red["L"]), set())
+        esperas = {"a": {"L": 10.0}}
+        self.assertEqual(
+            ranking.pasadas_en_parada("L", "a", esperas, red, self.PARADAS), [10.0]
+        )
+        self.assertEqual(
+            ranking.pasadas_en_parada("L", "b", esperas, red, self.PARADAS),
+            [round(10.0 + self.minutos("a", "b"), 2)],
+        )
+
+    def test_penalizacion_transbordo_evita_transbordo_innecesario(self):
+        # Direct M2 (7 min walk, 63 min clock) beats CA+M2 (0 min walk, 63 min clock).
+        red = {"CA": ["0", "1"], "M2": ["1", "2"]}
+        paradas = {
+            "0": (38.879, -6.974),
+            "1": (38.875, -6.974),
+            "2": (38.861, -6.940),
+        }
+        rutas = [
+            [{"linea": "CA", "subir": "0", "bajar": "1"},
+             {"linea": "M2", "subir": "1", "bajar": "2"}],
+            [{"linea": "M2", "subir": "1", "bajar": "2"}],
+        ]
+        salida = ranking.puntuar(
+            rutas, red, paradas, {"0": {"CA": 10.0}, "1": {"M2": 30.0}},
+            andando_origen={"0": 0.0, "1": 0.40},
+        )
+        self.assertEqual([t["linea"] for t in salida[0]["tramos"]], ["M2"])
+
+    def test_conserva_segunda_linea_directa_como_alternativa(self):
+        red = {"18": ["1", "3"], "9": ["2", "3"]}
+        paradas = {"1": (38.880, -6.970), "2": (38.881, -6.970), "3": (38.880, -6.950)}
+        rutas = [
+            [{"linea": "18", "subir": "1", "bajar": "3"}],
+            [{"linea": "9", "subir": "2", "bajar": "3"}],
+        ]
+        salida = ranking.puntuar(
+            rutas, red, paradas, {"1": {"18": 10.0}, "2": {"9": 12.0}},
+            andando_origen={"1": 0.10, "2": 0.35},
+        )
+        self.assertEqual([r["tramos"][0]["linea"] for r in salida], ["18", "9"])
 
 
 class TestCargarParadas(unittest.TestCase):
